@@ -13,6 +13,7 @@ config DW3000
 	default y
 
 config UWB_SLEEP_ENABLED
+	bool "Enable UWB Sleep"
 	default y
 
 endif # SHIELD_SHIELD_QORVO_DWS3000
