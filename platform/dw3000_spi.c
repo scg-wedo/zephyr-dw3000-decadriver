@@ -8,7 +8,10 @@
 #include <zephyr/drivers/spi.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/pm/device.h>
+#include <zephyr/drivers/pinctrl.h>
+
+#include <soc.h>
+#include <nrfx_spim.h>
 
 #include "dw3000_spi.h"
 
@@ -23,156 +26,241 @@ LOG_MODULE_DECLARE(dw3000, CONFIG_DW3000_LOG_LEVEL);
 #define DW_INST DT_INST(0, decawave_dw3000)
 #define DW_SPI	DT_PARENT(DT_INST(0, decawave_dw3000))
 
-static const struct device* spi;
 #if KERNEL_VERSION_MAJOR > 3                                                   \
 	|| (KERNEL_VERSION_MAJOR == 3 && KERNEL_VERSION_MINOR >= 4)
 static struct spi_cs_control cs_ctrl = SPI_CS_CONTROL_INIT(DW_INST, 0);
 #else
 static struct spi_cs_control* cs_ctrl = SPI_CS_CONTROL_PTR_DT(DW_INST, 0);
 #endif
-static struct spi_config spi_cfgs[2] = {0}; // configs for slow and fast
-static struct spi_config* spi_cfg;
+
+#define SPI_BUS_ADDR DT_REG_ADDR(DW_SPI)
+
+#if (SPI_BUS_ADDR == NRF_SPIM0_BASE)
+	#define SPI_INSTANCE_NUM 0
+#elif (SPI_BUS_ADDR == NRF_SPIM1_BASE)
+	#define SPI_INSTANCE_NUM 1
+#elif (SPI_BUS_ADDR == NRF_SPIM2_BASE)
+	#define SPI_INSTANCE_NUM 2
+#elif (SPI_BUS_ADDR == NRF_SPIM3_BASE)
+	#define SPI_INSTANCE_NUM 3
+#else
+	#error "Unsupported SPIM instance address"
+#endif
+
+#define SPIM_INST_IDX SPI_INSTANCE_NUM
+#define SPIM_INST NRFX_CONCAT_2(NRF_SPIM, SPIM_INST_IDX)
+#define SPIM_INST_HANDLER NRFX_CONCAT_3(nrfx_spim_, SPIM_INST_IDX, _irq_handler)
+
+#define SPIM_NODE DT_NODELABEL(NRFX_CONCAT_2(spi, SPIM_INST_IDX))
+PINCTRL_DT_DEFINE(SPIM_NODE);
+
+static nrfx_spim_t spim = NRFX_SPIM_INSTANCE(SPIM_INST_IDX);
+static uint32_t max_spi_frequency = DT_PROP(DW_INST, spi_max_frequency);
+static bool spim_initialized;
+static volatile bool transfer_finished = false;
+
+static uint8_t idatabuf[255] = {0};
+static uint8_t itempbuf[255] = {0};
+
+static void spim_handler(const nrfx_spim_evt_t *p_event, void *p_context)
+{
+	if (p_event->type == NRFX_SPIM_EVENT_DONE) {
+		transfer_finished = true;
+	}
+}
 
 int dw3000_spi_init(void)
 {
-	/* set common SPI config */
-	for (int i = 0; i < ARRAY_SIZE(spi_cfgs); i++) {
-		spi_cfgs[i].cs = cs_ctrl;
-		spi_cfgs[i].operation = SPI_WORD_SET(8);
-	}
-
-	/* SPI clock speed: Slow 2MHz, Max clock speed from DTS
-	 * We have to keep two different config structures due to the way the SPI
-	 * driver works */
-	spi_cfgs[0].frequency = 2000000;
-	spi_cfgs[1].frequency = DT_PROP(DW_INST, spi_max_frequency);
-	spi_cfg = &spi_cfgs[0];
-
-	spi = DEVICE_DT_GET(DW_SPI);
-	if (!spi) {
-		LOG_ERR("DW3000 SPI binding failed");
-		return -1;
-	} else {
-		LOG_INF("DW3000 SPI (max %dMHz)", spi_cfgs[1].frequency / 1000000);
-	}
-
-#if CONFIG_PM_DEVICE
-	enum pm_device_state pstate;
-	int rc = pm_device_state_get(spi, &pstate);
-	if (rc) {
-		LOG_ERR("PM state get %d", rc);
-	}
-
-	if (pstate != PM_DEVICE_STATE_ACTIVE) {
-		rc = pm_device_action_run(spi, PM_DEVICE_ACTION_RESUME);
-		if (rc) {
-			LOG_ERR("PM resume %d", rc);
-		}
-	}
+#if defined(__ZEPHYR__)
+	IRQ_DIRECT_CONNECT(NRFX_IRQ_NUMBER_GET(NRF_SPIM_INST_GET(SPIM_INST_IDX)), IRQ_PRIO_LOWEST,
+				NRFX_SPIM_INST_HANDLER_GET(SPIM_INST_IDX), 0);
 #endif
 
+	dw3000_spi_speed_slow();
+
 	// initialized correctly at boot but after fini we need to reconfigure
-	gpio_pin_configure_dt(&spi_cfg->cs.gpio, GPIO_OUTPUT_HIGH);
+	gpio_pin_configure_dt(&cs_ctrl.gpio, GPIO_OUTPUT_HIGH);
 
 	return 0;
 }
 
 void dw3000_spi_speed_slow(void)
 {
-	spi_cfg = &spi_cfgs[0];
+	int err;
+
+	if (spim_initialized) {
+		nrfx_spim_uninit(&spim);
+		spim_initialized = false;
+	}
+
+	nrfx_spim_config_t spim_config = NRFX_SPIM_DEFAULT_CONFIG(
+		NRF_SPIM_PIN_NOT_CONNECTED,
+		NRF_SPIM_PIN_NOT_CONNECTED,
+		NRF_SPIM_PIN_NOT_CONNECTED,
+		NRF_SPIM_PIN_NOT_CONNECTED
+	);
+	spim_config.frequency = NRFX_MHZ_TO_HZ(2);
+	spim_config.skip_gpio_cfg = true;
+	spim_config.skip_psel_cfg = true;
+
+	err = pinctrl_apply_state(PINCTRL_DT_DEV_CONFIG_GET(SPIM_NODE),
+							  PINCTRL_STATE_DEFAULT);
+	if (err < 0) {
+		LOG_INF("pinctrl_apply_state() slow speed failed: 0x%08x", err);
+		return;
+	}
+
+	err = nrfx_spim_init(&spim, &spim_config, spim_handler, NULL);
+	if (err != NRFX_SUCCESS) {
+		LOG_INF("nrfx_spim_init() slow speed failed: 0x%08x", err);
+		return;
+	}
+
+	spim_initialized = true;
 }
 
 void dw3000_spi_speed_fast(void)
 {
-	spi_cfg = &spi_cfgs[1];
+	int err;
+
+	if (spim_initialized) {
+		nrfx_spim_uninit(&spim);
+		spim_initialized = false;
+	}
+
+	nrfx_spim_config_t spim_config = NRFX_SPIM_DEFAULT_CONFIG(
+		NRF_SPIM_PIN_NOT_CONNECTED,
+		NRF_SPIM_PIN_NOT_CONNECTED,
+		NRF_SPIM_PIN_NOT_CONNECTED,
+		NRF_SPIM_PIN_NOT_CONNECTED
+	);
+	spim_config.frequency = max_spi_frequency;
+	spim_config.skip_gpio_cfg = true;
+	spim_config.skip_psel_cfg = true;
+
+	err = pinctrl_apply_state(PINCTRL_DT_DEV_CONFIG_GET(SPIM_NODE),
+							  PINCTRL_STATE_DEFAULT);
+	if (err < 0) {
+		LOG_INF("pinctrl_apply_state() fast speed failed: 0x%08x", err);
+		return;
+	}
+
+	err = nrfx_spim_init(&spim, &spim_config, spim_handler, NULL);
+	if (err != NRFX_SUCCESS) {
+		LOG_INF("nrfx_spim_init() fast speed failed: 0x%08x", err);
+		return;
+	}
+
+	spim_initialized = true;
 }
 
 void dw3000_spi_fini(void)
 {
-	// TODO: I can't find a SPI uninit function in Zephyr
-#if CONFIG_PM_DEVICE
-	int rc = pm_device_action_run(spi, PM_DEVICE_ACTION_SUSPEND);
-	if (rc) {
-		LOG_ERR("PM FINI suspend %d", rc);
+	if (spim_initialized) {
+		nrfx_spim_uninit(&spim);
+		spim_initialized = false;
 	}
-#endif
-	gpio_pin_configure_dt(&spi_cfg->cs.gpio, GPIO_DISCONNECTED);
+
+	gpio_pin_configure_dt(&cs_ctrl.gpio, GPIO_DISCONNECTED);
 }
 
 int32_t dw3000_spi_write_crc(uint16_t headerLength, const uint8_t* headerBuffer,
 							 uint16_t bodyLength, const uint8_t* bodyBuffer,
 							 uint8_t crc8)
 {
-	const struct spi_buf tx_buf[3] = {
-		{
-			.buf = (void*)headerBuffer,
-			.len = headerLength,
-		},
-		{
-			.buf = (void*)bodyBuffer,
-			.len = bodyLength,
-		},
-		{
-			.buf = &crc8,
-			.len = 1,
-		},
-	};
-	const struct spi_buf_set tx = {
-		.buffers = tx_buf,
-		.count = ARRAY_SIZE(tx_buf),
+	uint8_t *p1;
+	uint32_t idatalength = headerLength + bodyLength + sizeof(crc8);
+
+	p1 = idatabuf;
+	memcpy(p1, headerBuffer, headerLength);
+	p1 += headerLength;
+	memcpy(p1, bodyBuffer, bodyLength);
+	p1 += bodyLength;
+	memcpy(p1, &crc8, 1);
+
+	nrfx_err_t err;
+	nrfx_spim_xfer_desc_t xfer_desc = {
+		.p_tx_buffer = idatabuf,
+		.tx_length = idatalength,
+		.p_rx_buffer = itempbuf,
+		.rx_length = idatalength,
 	};
 
-	return spi_transceive(spi, spi_cfg, &tx, NULL);
+	transfer_finished = false;
+	gpio_pin_set_dt(&cs_ctrl.gpio, 1);
+	err = nrfx_spim_xfer(&spim, &xfer_desc, 0);
+	if (err != NRFX_SUCCESS) {
+		LOG_DBG("nrfx_spim_xfer() failed: 0x%08x", err);
+		return -EIO;
+	}
+	while (!transfer_finished);
+	gpio_pin_set_dt(&cs_ctrl.gpio, 0);
+
+	return 0;
 }
 
 int32_t dw3000_spi_write(uint16_t headerLength, const uint8_t* headerBuffer,
 						 uint16_t bodyLength, const uint8_t* bodyBuffer)
 {
-	const struct spi_buf tx_buf[2] = {
-		{
-			.buf = (void*)headerBuffer,
-			.len = headerLength,
-		},
-		{
-			.buf = (void*)bodyBuffer,
-			.len = bodyLength,
-		},
-	};
-	const struct spi_buf_set tx = {
-		.buffers = tx_buf,
-		.count = ARRAY_SIZE(tx_buf),
+	uint8_t *p1;
+	uint32_t idatalength = headerLength + bodyLength;
+
+	p1 = idatabuf;
+	memcpy(p1, headerBuffer, headerLength);
+	p1 += headerLength;
+	memcpy(p1, bodyBuffer, bodyLength);
+
+	nrfx_err_t err;
+	nrfx_spim_xfer_desc_t xfer_desc = {
+		.p_tx_buffer = idatabuf,
+		.tx_length = idatalength,
+		.p_rx_buffer = itempbuf,
+		.rx_length = idatalength,
 	};
 
-	return spi_transceive(spi, spi_cfg, &tx, NULL);
+	transfer_finished = false;
+	gpio_pin_set_dt(&cs_ctrl.gpio, 1);
+	err = nrfx_spim_xfer(&spim, &xfer_desc, 0);
+	if (err != NRFX_SUCCESS) {
+		LOG_DBG("nrfx_spim_xfer() failed: 0x%08x", err);
+		return -EIO;
+	}
+	while (!transfer_finished);
+	gpio_pin_set_dt(&cs_ctrl.gpio, 0);
+
+	return 0;
 }
 
 int32_t dw3000_spi_read(uint16_t headerLength, uint8_t* headerBuffer,
 						uint16_t readLength, uint8_t* readBuffer)
 {
-	const struct spi_buf tx_buf = {
-		.buf = headerBuffer,
-		.len = headerLength,
-	};
-	const struct spi_buf_set tx = {
-		.buffers = &tx_buf,
-		.count = 1,
-	};
-	const struct spi_buf rx_buf[2] = {
-		{
-			.buf = NULL,
-			.len = headerLength,
-		},
-		{
-			.buf = readBuffer,
-			.len = readLength,
-		},
-	};
-	const struct spi_buf_set rx = {
-		.buffers = rx_buf,
-		.count = ARRAY_SIZE(rx_buf),
+	uint8_t *p1;
+	uint32_t idatalength = headerLength + readLength;
+
+	p1 = idatabuf;
+	memcpy(p1, headerBuffer, headerLength);
+	p1 += headerLength;
+	memset(p1, 0x00, readLength);
+
+	nrfx_err_t err;
+	nrfx_spim_xfer_desc_t xfer_desc = {
+		.p_tx_buffer = idatabuf,
+		.tx_length = idatalength,
+		.p_rx_buffer = itempbuf,
+		.rx_length = idatalength,
 	};
 
-	int ret = spi_transceive(spi, spi_cfg, &tx, &rx);
+	transfer_finished = false;
+	gpio_pin_set_dt(&cs_ctrl.gpio, 1);
+	err = nrfx_spim_xfer(&spim, &xfer_desc, 0);
+	if (err != NRFX_SUCCESS) {
+		LOG_DBG("nrfx_spim_xfer() failed: 0x%08x", err);
+		return -EIO;
+	}
+	while (!transfer_finished);
+	gpio_pin_set_dt(&cs_ctrl.gpio, 0);
+
+	memcpy(readBuffer, itempbuf + headerLength, readLength);
 
 #if (CONFIG_SOC_NRF52840_QIAA)
 	/*
@@ -188,7 +276,7 @@ int32_t dw3000_spi_read(uint16_t headerLength, uint8_t* headerBuffer,
 	}
 #endif
 
-	return ret;
+	return 0;
 }
 
 void dw3000_spi_wakeup()
